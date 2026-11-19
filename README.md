@@ -1,6 +1,6 @@
 # Hue Go en macOS por Bluetooth
 
-Enciende una Philips Hue Go **LCT026** cada día a las **19:00**, sin Hue Bridge. Envía únicamente la orden de encendido, conserva el color y brillo configurados en la lámpara y comprueba el estado después de escribirlo. No incluye apagado automático, servicios remotos ni telemetría.
+Enciende una Philips Hue Go **LCT026** cada día a las **19:00** y la apaga a la **01:00** si sigue encendida, sin Hue Bridge. Solo envía la orden de encendido o apagado cuando hace falta, conserva el color y brillo configurados en la lámpara y comprueba el estado después de escribirlo. No incluye servicios remotos ni telemetría.
 
 Python y [Bleak](https://github.com/hbldh/bleak) realizan la comunicación Bluetooth. Una app pequeña en Swift, **Hue Horario**, da al proceso una identidad propia para el permiso de macOS. Un LaunchAgent abre esa app en el horario elegido.
 
@@ -85,11 +85,13 @@ Su estructura es:
 {
   "address": "REPLACE_WITH_BLUETOOTH_DEVICE_UUID",
   "hour": 19,
-  "minute": 0
+  "minute": 0,
+  "off_hour": 1,
+  "off_minute": 0
 }
 ```
 
-Reemplazar únicamente el marcador de `address` por el UUID encontrado. `hour` y `minute` son enteros en formato de 24 horas. Si se omiten, se usan 19 y 0. No se aceptan campos desconocidos. El ejemplo, una dirección vacía o un horario inválido impiden activar el agente. La validación sintáctica del UUID no demuestra que la luz esté disponible; confirmar la lectura antes de activar.
+Reemplazar únicamente el marcador de `address` por el UUID encontrado. `hour` y `minute` (encendido) y `off_hour` y `off_minute` (apagado) son enteros en formato de 24 horas. Si se omiten, se usan 19:00 y 01:00. Ambos horarios deben separarse al menos 15 minutos. No se aceptan campos desconocidos. El ejemplo, una dirección vacía o un horario inválido impiden activar el agente. La validación sintáctica del UUID no demuestra que la luz esté disponible; confirmar la lectura antes de activar.
 
 Consultar el estado sin encender:
 
@@ -147,15 +149,15 @@ El comando falla si no está cargado. Que un agente esté cargado no confirma un
 
 ## Hora local, suspensión y duplicados
 
-El LaunchAgent y Python usan **el reloj y la zona horaria del sistema macOS**. No hay una zona fija de Buenos Aires. A las 19:00 locales comienza una ventana de 15 minutos; desde las 19:15 se omite el encendido. La ventana se vuelve a comprobar antes de escribir la orden, además de al iniciar cada intento.
+El LaunchAgent y Python usan **el reloj y la zona horaria del sistema macOS**. No hay una zona fija de Buenos Aires. A las 19:00 y a la 01:00 locales comienza una ventana de 15 minutos; después se omite la acción. La ventana se vuelve a comprobar antes de escribir la orden, además de al iniciar cada intento.
 
-Para cambiar el horario, desactivar el agente, editar `hour` y `minute` en `config.json`, volver a ejecutar `enable` y consultar `status`. No editar solo el plist: Python valida contra la configuración. Si cambia la zona horaria del sistema, desactivar y reactivar para que ambos usen el nuevo horario local. `status` muestra el horario configurado y el del plist instalado.
+Para cambiar el horario, desactivar el agente, editar `hour`, `minute`, `off_hour` u `off_minute` en `config.json`, volver a ejecutar `enable` y consultar `status`. No editar solo el plist: Python valida contra la configuración. Si cambia la zona horaria del sistema, desactivar y reactivar para que ambos usen el nuevo horario local. `status` muestra el horario configurado y el del plist instalado.
 
 - La Mac apagada o con la sesión cerrada no ejecuta este LaunchAgent de usuario. No se garantiza recuperar el encendido al iniciar sesión.
 - Si está suspendida a la hora prevista, `launchd` puede ejecutar el evento pendiente al despertar. Solo se permite encender dentro de la ventana; más tarde se omite. Varios eventos pendientes se agrupan en uno. Es el comportamiento de `StartCalendarInterval` descrito en `man launchd.plist`.
 - No se programa un despertar, no se evita la suspensión y no se cambian ajustes de energía. Cerrar la tapa puede impedir el encendido puntual.
-- Hay hasta tres intentos programados, con un límite de 50 segundos por intento y 10 segundos entre fallos. Las operaciones manuales tienen un solo intento. Los avisos de permiso o emparejamiento pueden agotar ese tiempo.
-- Un encendido programado confirmado guarda su fecha en `last-success.json`. Otra ejecución para esa fecha se omite, incluso si la luz se apagó después. Un bloqueo evita operaciones de control simultáneas. Los comandos manuales `on` no registran el éxito diario.
+- Las ejecuciones programadas reintentan mientras dure la ventana de 15 minutos (hasta 15 intentos), con un límite de 50 segundos por intento y esperas crecientes de 10 a 30 segundos entre fallos. Así se toleran los cortes transitorios de Bluetooth, como `CBErrorDomain Code=15` o una desconexión después de escribir: el intento siguiente reconecta y confirma el estado. Las operaciones manuales tienen un solo intento. Los avisos de permiso o emparejamiento pueden agotar ese tiempo.
+- Cada encendido o apagado programado confirmado guarda su fecha en `last-success.json` (`date` y `off_date`). Otra ejecución de la misma acción para esa fecha se omite, incluso si la luz cambió después. Un bloqueo evita operaciones de control simultáneas. Los comandos manuales `on` no registran el éxito diario.
 - En un horario cercano a medianoche, la fecha guardada corresponde al comienzo de la ventana. Los cambios manuales del reloj pueden cambiar esa referencia. No es un sistema de entrega garantizada: si el proceso se interrumpe después de escribir y antes de guardar el éxito, un reintento puede repetir la orden de encendido.
 
 ## Diagnóstico

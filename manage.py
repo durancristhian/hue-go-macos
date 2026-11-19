@@ -93,7 +93,10 @@ def generate(root):
     payload = {
         "Label": LABEL,
         "ProgramArguments": arguments(app),
-        "StartCalendarInterval": {"Hour": config["hour"], "Minute": config["minute"]},
+        "StartCalendarInterval": [
+            {"Hour": config["hour"], "Minute": config["minute"]},
+            {"Hour": config["off_hour"], "Minute": config["off_minute"]},
+        ],
         "StandardOutPath": str(runtime / "launchd.log"),
         "StandardErrorPath": str(runtime / "launchd-error.log"),
         "ProcessType": "Background",
@@ -102,7 +105,7 @@ def generate(root):
     target = runtime / f"{LABEL}.plist"
     target.write_bytes(plistlib.dumps(payload))
     target.chmod(0o600)
-    print(f"Plist preparado: {target}\nHorario local: {config['hour']:02d}:{config['minute']:02d}")
+    print(f"Plist preparado: {target}\n{schedule_description(config)}")
     return target
 
 
@@ -128,10 +131,15 @@ def disable(root):
     print("Horario desactivado. Se conservaron la app, configuración, estado y plist.")
 
 
+def schedule_description(config):
+    return (f"Encendido: {config['hour']:02d}:{config['minute']:02d}; "
+            f"apagado: {config['off_hour']:02d}:{config['off_minute']:02d}, hora local de macOS")
+
+
 def status(root):
     _, runtime, agent = locations(root)
     config = load_config(runtime / "config.json")
-    print(f"Configuración: {config['hour']:02d}:{config['minute']:02d}, hora local de macOS", flush=True)
+    print(schedule_description(config), flush=True)
     if agent.exists():
         data = plistlib.loads(agent.read_bytes())
         print("Horario del plist instalado:", data.get("StartCalendarInterval"), flush=True)

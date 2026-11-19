@@ -78,7 +78,7 @@ class ProjectTests(unittest.TestCase):
         data = plistlib.loads(manage.generate(self.root).read_bytes())
         app, runtime, _ = manage.locations(self.root)
         self.assertEqual(data["ProgramArguments"], ["/usr/bin/open", "-n", "-g", "-W", str(app), "--args", "scheduled"])
-        self.assertEqual(data["StartCalendarInterval"], {"Hour": 20, "Minute": 30})
+        self.assertEqual(data["StartCalendarInterval"], [{"Hour": 20, "Minute": 30}, {"Hour": 1, "Minute": 0}])
         self.assertEqual(data["StandardOutPath"], str(runtime / "launchd.log"))
         self.assertNotIn("RunAtLoad", data)
         self.assertNotIn("KeepAlive", data)
@@ -115,7 +115,10 @@ class ProjectTests(unittest.TestCase):
 
     def run_scheduled(self, state, control, now):
         with patch.object(hue, "datetime") as clock, patch.object(hue, "control", control), patch.object(hue.asyncio, "sleep", new_callable=AsyncMock):
-            clock.now.return_value.astimezone.return_value = now
+            if isinstance(now, list):
+                clock.now.return_value.astimezone.side_effect = now
+            else:
+                clock.now.return_value.astimezone.return_value = now
             asyncio.run(hue.run_control(self.config["address"], self.config, True, state, "scheduled"))
 
     def test_confirmation_prevents_duplicate_and_late_runs(self):
@@ -132,8 +135,40 @@ class ProjectTests(unittest.TestCase):
         control = AsyncMock(side_effect=RuntimeError("Simulated connection failure"))
         with self.assertRaises(RuntimeError):
             self.run_scheduled(state, control, datetime(2030, 1, 2, 19, 0))
-        self.assertEqual(control.await_count, 3)
+        self.assertEqual(control.await_count, hue.MAX_SCHEDULED_ATTEMPTS)
         self.assertFalse(state.exists())
+
+    def test_transient_failures_are_retried_until_success(self):
+        state = self.root / "last-success.json"
+        control = AsyncMock(side_effect=[RuntimeError("disconnected")] * 5 + [{"power": "01"}])
+        self.run_scheduled(state, control, datetime(2030, 1, 2, 19, 0))
+        self.assertEqual(control.await_count, 6)
+        self.assertEqual(json.loads(state.read_text()), {"date": "2030-01-02"})
+
+    def test_failures_stop_when_window_ends(self):
+        state = self.root / "last-success.json"
+        control = AsyncMock(side_effect=RuntimeError("Simulated connection failure"))
+        # Lecturas del reloj: inicio, intento 1, log, intento 2, log, intento 3.
+        clock = [datetime(2030, 1, 2, 19, minute) for minute in (0, 0, 5, 10, 10, 15)]
+        with self.assertRaises(RuntimeError) as raised:
+            self.run_scheduled(state, control, clock)
+        self.assertEqual(control.await_count, 2)
+        self.assertIn("ventana", str(raised.exception))
+        self.assertFalse(state.exists())
+
+    def test_scheduled_off_turns_light_off_once(self):
+        state = self.root / "last-success.json"
+        state.write_text(json.dumps({"date": "2030-01-02"}))
+        control = AsyncMock(return_value={"power": "00"})
+        self.run_scheduled(state, control, datetime(2030, 1, 3, 1, 0))
+        self.run_scheduled(state, control, datetime(2030, 1, 3, 1, 5))
+        self.assertEqual(control.await_count, 1)
+        self.assertIs(control.await_args.kwargs["turn_on"], False)
+        self.assertEqual(json.loads(state.read_text()), {"date": "2030-01-02", "off_date": "2030-01-03"})
+
+    def test_on_and_off_times_must_be_apart(self):
+        with self.assertRaises(ValueError):
+            validate(dict(self.config, hour=1, minute=0, off_hour=1, off_minute=10))
 
     def test_lock_prevents_concurrent_commands(self):
         import fcntl
@@ -145,9 +180,9 @@ class ProjectTests(unittest.TestCase):
                 asyncio.run(hue.main(argparse.Namespace(command="scheduled", config=str(config), address=None)))
                 run.assert_not_called()
 
-    def fake_client(self, model=b"LCT026", after=b"\x01"):
+    def fake_client(self, model=b"LCT026", after=b"\x01", before=b"\x00"):
         client = AsyncMock()
-        client.read_gatt_char.side_effect = [model, b"\x00", after, b"\x72"]
+        client.read_gatt_char.side_effect = [model, before, after, b"\x72"]
         context = AsyncMock()
         context.__aenter__.return_value = client
         return client, SimpleNamespace(BleakClient=MagicMock(return_value=context))
@@ -159,6 +194,20 @@ class ProjectTests(unittest.TestCase):
         client.write_gatt_char.assert_awaited_once_with(hue.POWER, b"\x01", response=True)
         self.assertEqual(result["power"], "01")
         self.assertEqual(result["brightness_raw"], "72")
+
+    def test_off_writes_zero(self):
+        client, module = self.fake_client(before=b"\x01", after=b"\x00")
+        with patch.dict("sys.modules", bleak=module):
+            result = asyncio.run(hue.control(self.config["address"], turn_on=False))
+        client.write_gatt_char.assert_awaited_once_with(hue.POWER, b"\x00", response=True)
+        self.assertTrue(result["changed"])
+
+    def test_desired_state_is_not_rewritten(self):
+        client, module = self.fake_client(before=b"\x00", after=b"\x00")
+        with patch.dict("sys.modules", bleak=module):
+            result = asyncio.run(hue.control(self.config["address"], turn_on=False))
+        client.write_gatt_char.assert_not_called()
+        self.assertFalse(result["changed"])
 
     def test_wrong_model_never_writes(self):
         client, module = self.fake_client(model=b"unsupported")
